@@ -1,0 +1,927 @@
+# ============================================================================
+# ePaper Display – wake → render → deep sleep
+# Seeed Studio TRMNL DIY Kit (ESP32-S3) + Waveshare 7.5" (800x480)
+#
+# HOW IT WORKS
+#  - All content + settings live ON THE DEVICE (flash) and are edited on the
+#    ESPHome device page in HA. They can only be edited while it's awake:
+#      * press the Refresh button -> 3-minute edit window, or
+#      * on USB power (always awake), or
+#      * "Wakker blijven" switch on (flip it during an awake window).
+#    Edits made while awake are drawn on screen a few seconds later.
+#  - Timer wake  -> next step in the cycle
+#    Left button -> previous step (wakes the device instantly)
+#    Refresh btn -> re-render + 3-min edit window
+#  - Cold boot (power on / reset button / after flashing) stays awake 5 min.
+#    If WiFi fails during that window, the fallback hotspot comes up
+#    (after ~1 min) so you can fix WiFi or upload firmware via the web UI.
+#  - Hard safety net: it always sleeps after 3 min (5 min edit window, 6 min cold boot).
+# ============================================================================
+
+esphome:
+  name: epaper-display
+  friendly_name: ePaper Display
+  compile_process_limit: 1
+  on_boot:
+    - priority: 600
+      then:
+        - output.turn_on: bsp_battery_enable
+        - lambda: |-
+            // Figure out WHY we woke up, before anything else happens
+            auto cause = esp_sleep_get_wakeup_cause();
+            if (cause == ESP_SLEEP_WAKEUP_TIMER) {
+              id(wake_reason) = 0;
+              id(timer_wake) = true;
+            } else if (cause == ESP_SLEEP_WAKEUP_EXT1) {
+              uint64_t mask = esp_sleep_get_ext1_wakeup_status();
+              if (mask & (1ULL << 2)) id(wake_reason) = 1;       // left button
+              else { id(wake_reason) = 2; id(edit_window) = true; }  // refresh button
+            } else {
+              id(wake_reason) = 3;                                // cold boot
+              id(cold_boot) = true;
+            }
+            ESP_LOGI("wake", "Wake reason: %d", id(wake_reason));
+    - priority: -100
+      then:
+        - script.execute: safety_net
+        - script.execute: wake_cycle
+
+esp32:
+  board: esp32-s3-devkitc-1
+  framework:
+    type: esp-idf
+
+logger:
+  level: INFO
+
+api:
+  encryption:
+    key: !secret epaper_api_key
+
+ota:
+  - platform: esphome
+    password: !secret epaper_ota_password
+  - platform: web_server          # firmware upload via the web interface
+
+# Web UI + firmware upload. Only reachable while awake (cold-boot window or stay-awake mode)
+web_server:
+  port: 80
+  auth:
+    username: admin
+    password: !secret epaper_web_password
+
+# Captive portal on the fallback hotspot: set new WiFi credentials / upload firmware
+captive_portal:
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  fast_connect: true          # skip the scan, connect straight to the SSID
+  # Fallback hotspot: starts when WiFi can't connect for ap_timeout.
+  # Only realistic during the 5-min cold-boot window (normal wakes sleep sooner).
+  ap:
+    ssid: "Epaper-Display Fallback"
+    password: !secret epaper_ap_password
+  ap_timeout: 60s
+  # A static IP saves another ~1-2s per wake (= battery). Optional:
+  # manual_ip:
+  #   static_ip: 192.168.1.80
+  #   gateway: 192.168.1.1
+  #   subnet: 255.255.255.0
+  #   dns1: 192.168.1.1
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+spi:
+  - id: spi_bus
+    clk_pin: GPIO7
+    mosi_pin: GPIO9
+
+output:
+  - platform: gpio
+    pin: GPIO6
+    id: bsp_battery_enable
+
+time:
+  - platform: homeassistant
+    id: ha_time
+
+# ----------------------------------------------------------------------------
+# Deep sleep. No run_duration/sleep_duration here: the scripts decide when and
+# for how long. Both buttons can wake the device.
+# ----------------------------------------------------------------------------
+deep_sleep:
+  id: deep_sleep_1
+  esp32_ext1_wakeup:
+    pins:
+      - number: GPIO2
+        allow_other_uses: true
+      - number: GPIO5
+        allow_other_uses: true
+    mode: ANY_LOW
+
+globals:
+  - id: display_page
+    type: int
+    restore_value: true       # survives deep sleep (flushed to flash before sleeping)
+    initial_value: '0'
+  - id: seq_step              # position in the cycle (see step_sequence)
+    type: int
+    restore_value: true
+    initial_value: '0'
+  - id: last_quote            # last quote page shown, so shuffle never repeats one
+    type: int
+    restore_value: true
+    initial_value: '1'
+  - id: wake_reason           # 0=timer 1=left 2=refresh 3=cold boot
+    type: int
+    restore_value: false
+    initial_value: '3'
+  - id: timer_wake            # true only for a plain timer wake (used to measure awake time)
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: avg_awake_ms          # running average of a normal wake, learned from real wakes
+    type: float
+    restore_value: true
+    initial_value: '16500'
+  - id: edit_window
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: cold_boot
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: low_battery
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: last_render_ok
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+
+# ----------------------------------------------------------------------------
+# Content + settings, pulled from Home Assistant helpers on every wake
+# ----------------------------------------------------------------------------
+text_sensor:
+  # What the screen is showing right now (keeps its last value while the device sleeps)
+  - platform: template
+    id: current_page_text
+    name: "Huidige pagina"
+    icon: "mdi:book-open-page-variant"
+    update_interval: never
+  # Weather
+  - platform: homeassistant
+    id: weather_forecast_home
+    entity_id: weather.buienradar
+    internal: true
+
+sensor:
+  - platform: homeassistant
+    id: sensor_buienradar_feel_temperature
+    entity_id: sensor.buienradar_feel_temperature
+    internal: true
+  - platform: homeassistant
+    id: sensor_buienradar_wind_force
+    entity_id: sensor.buienradar_wind_force
+    internal: true
+
+  - platform: adc
+    pin: GPIO1
+    name: "Battery Voltage"
+    id: battery_voltage
+    unit_of_measurement: "V"
+    device_class: voltage
+    state_class: measurement
+    update_interval: never      # read once per wake, from wake_cycle
+    attenuation: auto
+    accuracy_decimals: 2
+    filters:
+      - multiply: 2
+      # Drop impossible readings (ADC glitch / divider not powered yet) instead of publishing them
+      - lambda: |-
+          if (isnan(x) || x < 2.5 || x > 4.5) return {};
+          return x;
+  - platform: template
+    name: "Battery Level"
+    id: battery_level
+    unit_of_measurement: "%"
+    device_class: battery
+    state_class: measurement
+    update_interval: never
+    lambda: |-
+      // No valid voltage yet -> publish nothing (HA keeps the last known value)
+      if (!id(battery_voltage).has_state() || isnan(id(battery_voltage).state)) return {};
+      return id(battery_voltage).state;
+    filters:
+      - calibrate_linear:
+          - 4.15 -> 100
+          - 3.96 -> 90
+          - 3.91 -> 80
+          - 3.85 -> 70
+          - 3.8 -> 60
+          - 3.75 -> 50
+          - 3.68 -> 40
+          - 3.58 -> 30
+          - 3.49 -> 20
+          - 3.41 -> 10
+          - 3.3 -> 5
+          - 3.27 -> 0
+      - clamp:
+          min_value: 0
+          max_value: 100
+  # Estimated battery life left, from battery %, refresh interval and measured awake time
+  - platform: template
+    id: battery_days_left
+    name: "Geschatte resterende batterijduur"
+    icon: "mdi:battery-clock"
+    unit_of_measurement: "d"
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: never
+    lambda: |-
+      const float CAPACITY_MAH = 2000.0f;
+      const float HEALTH       = 0.9f;    // aging / cutoff margin
+      const float AWAKE_MA     = 100.0f;  // average while awake (WiFi + refresh)
+      const float SLEEP_MA     = 0.06f;   // deep sleep, whole board (estimate)
+
+      if (id(usb_power).state) return {};                 // charging: meaningless
+      float level = id(battery_level).state;
+      if (isnan(level)) return {};
+
+      static const int MINS[] = {5, 10, 30, 60};
+      auto idx = id(cfg_interval).active_index();
+      int mins = idx.has_value() ? MINS[*idx] : 30;
+      if (id(low_battery)) mins = 360;                    // 6h sleeps in low-battery mode
+
+      float wakes_per_day = 1440.0f / mins;
+      float mah_per_wake  = (id(avg_awake_ms) / 1000.0f) * AWAKE_MA / 3600.0f;
+      float mah_per_day   = wakes_per_day * mah_per_wake + SLEEP_MA * 24.0f;
+      float remaining_mah = CAPACITY_MAH * HEALTH * level / 100.0f;
+      return remaining_mah / mah_per_day;
+
+  - platform: wifi_signal
+    name: "WiFi Signal"
+    id: wifi_signal_dbm
+    update_interval: never
+
+binary_sensor:
+  # "Charging / on USB" guessed from battery voltage: the charger holds the cell at ~4.2V.
+  # Hysteresis so it doesn't flap. Only detects USB once the cell is (nearly) full, see notes.
+  - platform: template
+    id: usb_power
+    name: "Op netstroom"
+    device_class: plug
+    lambda: |-
+      float v = id(battery_voltage).state;
+      if (isnan(v)) return {};
+      if (v >= 4.18) return true;
+      if (v < 4.12) return false;
+      return id(usb_power).state;
+    on_release:
+      # Unplugged while awake -> back to the battery routine (not during boot)
+      - if:
+          condition:
+            lambda: 'return millis() > 15000 && !id(wake_cycle).is_running();'
+          then:
+            - script.stop: powered_loop
+            - script.execute: go_to_sleep
+  # Physical buttons while awake (the wake-from-sleep press is handled via wake_reason)
+  - platform: gpio
+    pin:
+      number: GPIO2
+      mode: INPUT_PULLUP
+      inverted: true
+      allow_other_uses: true
+    name: "Left Button"
+    id: button_left
+    on_press:
+      - if:
+          condition:
+            lambda: 'return millis() > 5000;'   # ignore the press that woke us
+          then:
+            - script.execute:
+                id: change_page_to
+                delta: -1
+  - platform: gpio
+    pin:
+      number: GPIO5
+      mode: INPUT_PULLUP
+      inverted: true
+      allow_other_uses: true
+    name: "Refresh Button"
+    id: button_refresh
+    on_press:
+      - if:
+          condition:
+            lambda: 'return millis() > 5000;'
+          then:
+            - script.execute: prepare_content
+            - component.update: epaper_display
+
+# While awake (USB / stay-awake mode) keep the battery reading fresh
+interval:
+  - interval: 60s
+    then:
+      - if:
+          condition:
+            lambda: 'return millis() > 60000;'
+          then:
+            - output.turn_on: bsp_battery_enable
+            - component.update: battery_voltage
+            - component.update: battery_level
+            - component.update: wifi_signal_dbm
+
+# These only work while the device is awake (stay-awake mode), useful for testing
+button:
+  - platform: template
+    name: "Next Page"
+    on_press:
+      - script.execute:
+          id: change_page_to
+          delta: 1
+  - platform: template
+    name: "Previous Page"
+    on_press:
+      - script.execute:
+          id: change_page_to
+          delta: -1
+  - platform: template
+    name: "Refresh Display"
+    on_press:
+      - script.execute: prepare_content
+      - component.update: epaper_display
+
+# ----------------------------------------------------------------------------
+# Content + settings: stored on flash, editable on the ESPHome device page
+# (only while the device is awake)
+# ----------------------------------------------------------------------------
+text:
+  - platform: template
+    id: c_bier_qr
+    name: "Betaal-QR link"
+    icon: "mdi:qrcode-edit"
+    optimistic: true
+    restore_value: true
+    mode: TEXT
+    min_length: 0
+    max_length: 255
+    initial_value: "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+    on_value:
+      - script.execute: content_changed
+  - platform: template
+    id: c_bier_text
+    name: "Tekst naast betaal-QR (38)"
+    icon: "mdi:cursor-text"
+    optimistic: true
+    restore_value: true
+    mode: TEXT
+    min_length: 0
+    max_length: 38
+    initial_value: "Scan mij en regel bier voor allen!"
+    on_value:
+      - script.execute: content_changed
+  - platform: template
+    id: c_wifi_ssid
+    name: "WiFi naam"
+    icon: "mdi:wifi"
+    optimistic: true
+    restore_value: true
+    mode: TEXT
+    min_length: 0
+    max_length: 32
+    initial_value: "Vul SSID in"
+    on_value:
+      - script.execute: content_changed
+  - platform: template
+    id: c_wifi_password
+    name: "WiFi wachtwoord"
+    icon: "mdi:wifi-lock"
+    optimistic: true
+    restore_value: true
+    mode: PASSWORD
+    min_length: 0
+    max_length: 63
+    initial_value: ""
+    on_value:
+      - script.execute: content_changed
+  - platform: template
+    id: c_wifi_text
+    name: "Tekst naast WiFi-QR (32)"
+    icon: "mdi:cursor-text"
+    optimistic: true
+    restore_value: true
+    mode: TEXT
+    min_length: 0
+    max_length: 32
+    initial_value: "Scan mij, WiFi voor iedereen!"
+    on_value:
+      - script.execute: content_changed
+  - platform: template
+    id: c_quote_1
+    name: "Quote 1 (72)"
+    icon: "mdi:format-quote-close"
+    optimistic: true
+    restore_value: true
+    mode: TEXT
+    min_length: 0
+    max_length: 72
+    initial_value: "Tering dikke bar hier"
+    on_value:
+      - script.execute: content_changed
+  - platform: template
+    id: c_quote_2
+    name: "Quote 2 (72)"
+    icon: "mdi:format-quote-close"
+    optimistic: true
+    restore_value: true
+    mode: TEXT
+    min_length: 0
+    max_length: 72
+    initial_value: "Jeffrey is een toffe peer"
+    on_value:
+      - script.execute: content_changed
+  - platform: template
+    id: c_quote_3
+    name: "Quote 3 (72)"
+    icon: "mdi:format-quote-close"
+    optimistic: true
+    restore_value: true
+    mode: TEXT
+    min_length: 0
+    max_length: 72
+    initial_value: "Als je maar vaak genoeg dobbelt gooi je vanzelf 6"
+    on_value:
+      - script.execute: content_changed
+
+select:
+  - platform: template
+    id: cfg_interval
+    name: "Ververs-interval"
+    icon: "mdi:timer-outline"
+    optimistic: true
+    restore_value: true
+    options: ["5 min", "10 min", "30 min", "60 min"]
+    initial_option: "30 min"
+    on_value:
+      - component.update: battery_days_left   # show the new estimate right away
+
+switch:
+  - platform: template
+    id: cfg_shuffle
+    name: "Willekeurige quotes"
+    icon: "mdi:shuffle-variant"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+  - platform: template
+    id: cfg_stay_awake
+    name: "Wakker blijven (bewerken/OTA)"
+    icon: "mdi:sleep-off"
+    optimistic: true
+    restore_mode: ALWAYS_OFF      # never come back from a reboot stuck awake
+    on_turn_on:
+      - deep_sleep.prevent: deep_sleep_1
+    on_turn_off:
+      # millis() guard: ALWAYS_OFF fires turn_off during boot, which must NOT trigger sleep
+      - if:
+          condition:
+            lambda: 'return millis() > 15000 && !id(wake_cycle).is_running();'
+          then:
+            - script.execute: go_to_sleep
+
+qr_code:
+  - id: qr_bier
+    value: "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+    ecc: MEDIUM
+  - id: wifi_qr
+    value: "WIFI:S:none;T:WPA;P:none;;"
+    ecc: MEDIUM
+
+# ----------------------------------------------------------------------------
+# Scripts
+# ----------------------------------------------------------------------------
+script:
+  # One full wake: sync -> choose page -> render -> sleep
+  - id: wake_cycle
+    mode: restart
+    then:
+      - wait_until:
+          condition:
+            lambda: |-
+              return api_is_connected()
+                  && id(ha_time).now().is_valid()
+                  && !std::isnan(id(sensor_buienradar_wind_force).state);
+          timeout: 20s
+      - lambda: |-
+          id(last_render_ok) = api_is_connected();
+          if (!id(last_render_ok))
+            ESP_LOGW("wake", "No Home Assistant connection, rendering from flash cache");
+      - delay: 1s   # let the last HA states trickle in
+      - component.update: battery_voltage
+      - component.update: battery_level
+      - component.update: battery_days_left
+      - delay: 500ms   # give the main loop a turn so the API actually sends these states
+      - component.update: wifi_signal_dbm
+      - lambda: |-
+          int delta = 0;                               // refresh / cold boot: keep page
+          if (id(wake_reason) == 0) delta = 1;         // timer: next in cycle
+          else if (id(wake_reason) == 1) delta = -1;   // left button: back one
+          id(wake_reason) = 2;  // re-runs within this wake don't advance again
+          id(step_sequence)->execute(delta);
+      - script.execute: prepare_content
+      - script.execute: publish_page_name
+      - component.update: epaper_display   # blocks until the panel is done
+      - if:
+          condition:
+            lambda: 'return id(edit_window) && !id(cold_boot);'
+          then:
+            - logger.log: "Refresh button: 3-minute edit window"
+            - delay: 180s
+            - lambda: 'id(edit_window) = false;'
+      - if:
+          condition:
+            lambda: 'return id(cold_boot);'
+          then:
+            - logger.log: "Cold boot: staying awake 5 min for OTA / web UI / fallback hotspot"
+            - delay: 300s
+            - lambda: 'id(cold_boot) = false;'   # only once, not every USB-mode cycle
+      - script.execute: go_to_sleep
+
+  # Copy HA values into the QR codes
+  - id: prepare_content
+    then:
+      - lambda: |-
+          float bat = id(battery_level).state;
+          id(low_battery) = !isnan(bat) && bat < 5;
+          if (!id(c_bier_qr).state.empty())
+            id(qr_bier).set_value(id(c_bier_qr).state);
+
+          // WiFi QR: ; , : \ and " must be escaped, otherwise phones fail to join
+          auto esc = [](const std::string &in) {
+            std::string out;
+            for (char c : in) {
+              if (c == '\\' || c == ';' || c == ',' || c == ':' || c == '"') out += '\\';
+              out += c;
+            }
+            return out;
+          };
+          if (!id(c_wifi_ssid).state.empty()) {
+            std::string pass = id(c_wifi_password).state;
+            std::string qr = "WIFI:S:" + esc(id(c_wifi_ssid).state) + ";";
+            qr += pass.empty() ? "T:nopass;;" : "T:WPA;P:" + esc(pass) + ";;";
+            id(wifi_qr).set_value(qr);
+          }
+
+  - id: publish_page_name
+    then:
+      - lambda: |-
+          static const char *NAMES[] = {"Betaal-QR", "Quote 1", "Quote 2", "WiFi-QR", "Quote 3"};
+          std::string name = id(low_battery) ? std::string("Batterij leeg") : std::string(NAMES[id(display_page)]);
+          id(current_page_text).publish_state(name);
+
+  # The cycle: Bier-QR, WiFi-QR, quote, Bier-QR, WiFi-QR, next quote, ...
+  # Page ids: 0 = Bier-QR, 3 = WiFi-QR, 1/2/4 = Quote 1/2/3
+  - id: step_sequence
+    parameters:
+      delta: int
+    then:
+      - lambda: |-
+          static const int SEQ[] = {0, 3, 1,  0, 3, 2,  0, 3, 4};
+          const int LEN = sizeof(SEQ) / sizeof(SEQ[0]);
+          int step = (((id(seq_step) + delta) % LEN) + LEN) % LEN;
+          id(seq_step) = step;
+          int page = SEQ[step];
+
+          bool is_quote = (page == 1 || page == 2 || page == 4);
+          if (is_quote && delta > 0 && id(cfg_shuffle).state) {
+            // Shuffle: random quote in this slot, never the same one twice in a row
+            static const int QUOTES[] = {1, 2, 4};
+            do { page = QUOTES[random_uint32() % 3]; } while (page == id(last_quote));
+          }
+          if (is_quote) id(last_quote) = page;
+
+          id(display_page) = page;
+          ESP_LOGI("cycle", "Step %d -> page %d", step, page);
+
+  # Manual page change while awake (buttons): step through the cycle and redraw
+  - id: change_page_to
+    parameters:
+      delta: int
+    then:
+      - script.execute:
+          id: step_sequence
+          delta: !lambda 'return delta;'
+      - script.execute: prepare_content
+      - script.execute: publish_page_name
+      - component.update: epaper_display
+
+  - id: go_to_sleep
+    mode: single
+    then:
+      - if:
+          condition:
+            switch.is_on: cfg_stay_awake
+          then:
+            - logger.log: "Stay-awake is ON in Home Assistant, not sleeping"
+            - deep_sleep.prevent: deep_sleep_1
+          else:
+            - if:
+                condition:
+                  binary_sensor.is_on: usb_power
+                then:
+                  # On USB power: no deep sleep, just wait the interval and refresh again
+                  - logger.log: "On USB power, staying awake"
+                  - deep_sleep.prevent: deep_sleep_1
+                  - script.execute: powered_loop
+                else:
+                  - output.turn_off: bsp_battery_enable
+                  # If buttons don't wake it, or it wakes in a loop, the board has no
+                  # external pull-ups on the buttons. Uncomment to keep the internal
+                  # RTC pull-ups alive during sleep (needs: esphome -> includes: driver/rtc_io.h)
+                  # - lambda: |-
+                  #     esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);
+                  #     rtc_gpio_pullup_en(GPIO_NUM_2);  rtc_gpio_pulldown_dis(GPIO_NUM_2);
+                  #     rtc_gpio_pullup_en(GPIO_NUM_5);  rtc_gpio_pulldown_dis(GPIO_NUM_5);
+                  - deep_sleep.allow: deep_sleep_1
+                  - lambda: |-
+                      // Learn how long a normal wake really takes (+1s for the delay below)
+                      if (id(timer_wake) && !id(cold_boot)) {
+                        float ms = millis() + 1000.0f;
+                        id(avg_awake_ms) = id(avg_awake_ms) * 0.8f + ms * 0.2f;
+                        ESP_LOGI("battery", "Awake %.0f ms, average now %.0f ms", ms, id(avg_awake_ms));
+                      }
+                  - delay: 1s      # flush pending API messages (page name, battery) before the radio goes off
+                  - deep_sleep.enter:
+                      id: deep_sleep_1
+                      sleep_duration: !lambda |-
+                        // "5 min" / "10 min" / "30 min" / "60 min" -> atoi reads the number
+                        static const int MINS[] = {5, 10, 30, 60};  int mins = id(cfg_interval).active_index().has_value() ? MINS[*id(cfg_interval).active_index()] : 30;
+                        if (mins <= 0) mins = 30;                       // fallback if HA value missing
+                        uint32_t secs = mins * 60;
+                        if (id(low_battery)) secs = 6 * 3600;           // charge message stays on screen, save what's left
+                        if (!id(last_render_ok)) secs = std::min<uint32_t>(secs, 300);  // retry in <=5 min
+                        ESP_LOGI("sleep", "Awake for %u ms, sleeping for %u s", millis(), secs);
+                        return secs * 1000;
+
+  # A value was edited while awake -> redraw shortly after (debounced)
+  - id: content_changed
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: 'return millis() > 15000;'   # ignore values restored from flash at boot
+          then:
+            - delay: 5s
+            - script.execute: prepare_content
+            - script.execute: publish_page_name
+            - component.update: epaper_display
+
+  # USB mode: behave like a timer wake, but without rebooting
+  - id: powered_loop
+    mode: restart
+    then:
+      - delay: !lambda |-
+          static const int MINS[] = {5, 10, 30, 60};  int mins = id(cfg_interval).active_index().has_value() ? MINS[*id(cfg_interval).active_index()] : 30;
+          if (mins <= 0) mins = 30;
+          return mins * 60000;
+      - lambda: 'id(wake_reason) = 0;'
+      - script.execute: wake_cycle
+
+  # Whatever goes wrong (HA hangs, display stuck...), never drain the battery
+  - id: safety_net
+    then:
+      - delay: !lambda 'return id(cold_boot) ? 360000 : (id(edit_window) ? 300000 : 180000);'
+      - logger.log:
+          level: WARN
+          format: "Safety net triggered, forcing sleep"
+      - if:
+          condition:
+            binary_sensor.is_off: usb_power
+          then:
+            - script.execute: go_to_sleep
+
+# ----------------------------------------------------------------------------
+# Fonts – shared glyph list incl. Dutch accents (é, ë, ï...) which were missing
+# ----------------------------------------------------------------------------
+font:
+  - file: &roboto400
+      type: gfonts
+      family: Roboto
+      weight: 400
+    id: font_roboto_400_80
+    size: 80
+    glyphs: &text_glyphs
+      - " !\"#$%&'()*+,-./0123456789:;<=>?@[\\]^_`{|}~°€"
+      - "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+      - "áàâäéèêëíìîïóòôöúùûüçñÁÀÄÉÈËÍÏÓÖÚÜ"
+  - file: *roboto400
+    id: font_roboto_400_35
+    size: 35
+    glyphs: *text_glyphs
+  - file: *roboto400
+    id: font_roboto_400_12
+    size: 12
+    glyphs: ["0123456789-.%dB"]
+  - file:
+      type: gfonts
+      family: Roboto
+      weight: 700
+    id: font_roboto_700_35
+    size: 35
+    glyphs: ["0123456789:-"]
+  - file: &mdi
+      url: "https://raw.githubusercontent.com/Templarian/MaterialDesign-Webfont/master/fonts/materialdesignicons-webfont.ttf"
+      type: web
+    id: font_material_design_icons_400_24
+    size: 24
+    glyphs: ["\U000F0079", "\U000F007A", "\U000F007B", "\U000F007C", "\U000F007D", "\U000F007E", "\U000F007F", "\U000F0080", "\U000F0081", "\U000F0082", "\U000F0083", "\U000F091F", "\U000F0922", "\U000F0925", "\U000F0928", "\U000F092B"]
+  - file: *mdi
+    id: font_material_design_icons_400_48
+    size: 48
+    glyphs: ["\U000F0590", "\U000F0591", "\U000F0592", "\U000F0593", "\U000F0594", "\U000F0595", "\U000F0597", "\U000F0598", "\U000F0599"]
+  - file: *mdi
+    id: font_material_design_icons_400_40
+    size: 40
+    glyphs: ["\U000F050F", "\U000F059D"]
+
+# ----------------------------------------------------------------------------
+# Display
+# ----------------------------------------------------------------------------
+display:
+  - platform: waveshare_epaper
+    id: epaper_display
+    cs_pin: GPIO44
+    dc_pin: GPIO10
+    reset_pin: GPIO38
+    busy_pin:
+      number: GPIO4
+      inverted: true
+    rotation: 0
+    model: "7.50inv2p"
+    update_interval: never
+    full_update_every: 30
+
+    lambda: |-
+      const auto COLOR_WHITE = Color(0, 0, 0);       // Inverted for e-ink
+      const auto COLOR_BLACK = Color(255, 255, 255); // Inverted for e-ink
+
+      // Word-wrap printer. draw=false only counts lines (used for centering).
+      auto print_wrapped_text = [&](int x, int y, int max_w, int line_h, esphome::font::Font *font,
+                                    Color color, TextAlign align, const char* text, bool draw) -> int {
+        if (!text || max_w <= 0) return 0;
+        int lines = 0;
+        int cy = y;
+        std::string line, word;
+        auto width_of = [&](const std::string &s) {
+          int w, xo, bl, h; font->measure(s.c_str(), &w, &xo, &bl, &h); return w;
+        };
+        auto flush_word = [&]() {
+          if (word.empty()) return;
+          std::string candidate = line.empty() ? word : line + " " + word;
+          if (!line.empty() && width_of(candidate) > max_w) {
+            if (draw) it.print(x, cy, font, color, align, line.c_str());
+            cy += line_h; lines++;
+            line = word;
+          } else {
+            line = candidate;
+          }
+          word.clear();
+        };
+        for (const char *p = text; *p; p++) {
+          if (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t') flush_word();
+          else word += *p;
+        }
+        flush_word();
+        if (!line.empty()) {
+          if (draw) it.print(x, cy, font, color, align, line.c_str());
+          lines++;
+        }
+        return lines;
+      };
+
+      // Quote centred horizontally AND vertically in the area above the footer
+      auto draw_quote = [&](const std::string &txt) {
+        const int top = 10, height = 400, line_h = 90;
+        auto *f = id(font_roboto_400_80);
+        int lines = print_wrapped_text(400, 0, 760, line_h, f, COLOR_BLACK, TextAlign::TOP_CENTER, txt.c_str(), false);
+        int y = top + (height - lines * line_h) / 2;
+        if (y < top) y = top;
+        print_wrapped_text(400, y, 760, line_h, f, COLOR_BLACK, TextAlign::TOP_CENTER, txt.c_str(), true);
+      };
+
+      // QR on the left, caption on the right
+      auto draw_qr_page = [&](esphome::qr_code::QrCode *qr, const std::string &caption) {
+        int scale = 380 / qr->get_size();
+        if (scale < 1) scale = 1;
+        it.qr_code(20, 20, qr, COLOR_BLACK, scale);
+        print_wrapped_text(420, 20, 370, 90, id(font_roboto_400_80), COLOR_BLACK,
+                           TextAlign::TOP_LEFT, caption.c_str(), true);
+      };
+
+      it.fill(COLOR_WHITE);
+      if (id(low_battery)) {
+        // Battery empty: payment QR + fixed charge message, vertically centred next to it
+        auto *qr = id(qr_bier);
+        int scale = 380 / qr->get_size();
+        if (scale < 1) scale = 1;
+        it.qr_code(20, 20, qr, COLOR_BLACK, scale);
+        const char *msg = "Mijn batterij is leeg. Betaal via deze link en zorg dat ik weer opgeladen wordt :(";
+        auto *f = id(font_roboto_400_35);
+        int lines = print_wrapped_text(420, 0, 360, 45, f, COLOR_BLACK, TextAlign::TOP_LEFT, msg, false);
+        int y = 10 + (400 - lines * 45) / 2;
+        print_wrapped_text(420, y, 360, 45, f, COLOR_BLACK, TextAlign::TOP_LEFT, msg, true);
+      } else switch (id(display_page)) {
+        case 0: draw_qr_page(id(qr_bier), id(c_bier_text).state); break;
+        case 1: draw_quote(id(c_quote_1).state); break;
+        case 2: draw_quote(id(c_quote_2).state); break;
+        case 3: draw_qr_page(id(wifi_qr), id(c_wifi_text).state); break;
+        case 4: draw_quote(id(c_quote_3).state); break;
+      }
+
+      // ───────────────────────── FOOTER ─────────────────────────
+      {
+        // Rounded border
+        auto draw_rrect_border = [&](int x, int y, int w, int h, int r, int t, Color c) {
+          it.filled_rectangle(x + r, y, w - 2 * r, t, c);
+          it.filled_rectangle(x + r, y + h - t, w - 2 * r, t, c);
+          it.filled_rectangle(x, y + r, t, h - 2 * r, c);
+          it.filled_rectangle(x + w - t, y + r, t, h - 2 * r, c);
+          for (int dx = 0; dx <= r; dx++) {
+            for (int dy = 0; dy <= r; dy++) {
+              int ds = dx * dx + dy * dy;
+              if (ds <= r * r && ds > (r - t) * (r - t)) {
+                it.draw_pixel_at(x + r - dx, y + r - dy, c);
+                it.draw_pixel_at(x + w - r + dx - 1, y + r - dy, c);
+                it.draw_pixel_at(x + r - dx, y + h - r + dy - 1, c);
+                it.draw_pixel_at(x + w - r + dx - 1, y + h - r + dy - 1, c);
+              }
+            }
+          }
+        };
+        draw_rrect_border(5, 415, 790, 60, 10, 4, COLOR_BLACK);
+
+        // Wind
+        it.printf(22, 425, id(font_material_design_icons_400_40), COLOR_BLACK, "%s", "\U000F059D");
+        float wind = id(sensor_buienradar_wind_force).state;
+        if (isnan(wind)) it.print(70, 425, id(font_roboto_400_35), COLOR_BLACK, "-");
+        else it.printf(70, 425, id(font_roboto_400_35), COLOR_BLACK, "%.0f", wind);
+
+        // Feels-like temperature
+        it.printf(200, 425, id(font_material_design_icons_400_40), COLOR_BLACK, "%s", "\U000F050F");
+        float temp = id(sensor_buienradar_feel_temperature).state;
+        if (isnan(temp)) it.print(240, 425, id(font_roboto_400_35), COLOR_BLACK, "--°C");
+        else it.printf(240, 425, id(font_roboto_400_35), COLOR_BLACK, "%.1f°C", temp);
+
+        // Weather icon
+        {
+          std::string ws = id(weather_forecast_home).state;
+          auto has = [&](const char *s) { return ws.find(s) != std::string::npos; };
+          const char *icon = "\U000F0599";
+          if (has("klar") || has("zonnig") || ws == "sunny") icon = "\U000F0599";
+          else if (has("lichtbewolkt") || ws == "partlycloudy") icon = "\U000F0595";
+          else if (ws == "bewolkt" || ws == "cloudy") icon = "\U000F0590";
+          else if (has("mist") || has("fog")) icon = "\U000F0591";
+          else if (has("hagel") || ws == "hail") icon = "\U000F0592";
+          else if (has("onweer") || has("lightning")) icon = "\U000F0593";
+          else if (has("regen") || ws == "rainy" || ws == "pouring") icon = "\U000F0597";
+          else if (has("sneeuw") || has("snowy")) icon = "\U000F0598";
+          else if (has("nacht") || ws == "clear-night") icon = "\U000F0594";
+          it.printf(400, 420, id(font_material_design_icons_400_48), COLOR_BLACK, "%s", icon);
+        }
+
+        // Time of this refresh
+        auto now = id(ha_time).now();
+        if (now.is_valid())
+          it.strftime(560, 425, id(font_roboto_700_35), COLOR_BLACK, TextAlign::TOP_CENTER, "%H:%M", now);
+
+        // WiFi
+        {
+          const char *wifi_icon = "\U000F092B";
+          float sig = id(wifi_signal_dbm).state;
+          if (!isnan(sig)) {
+            if (sig >= -50) wifi_icon = "\U000F0928";
+            else if (sig >= -60) wifi_icon = "\U000F0925";
+            else if (sig >= -75) wifi_icon = "\U000F0922";
+            else wifi_icon = "\U000F091F";
+            it.printf(720 + 12, 425 + 26, id(font_roboto_400_12), COLOR_BLACK, TextAlign::TOP_CENTER, "%.0fdB", sig);
+          }
+          it.printf(720, 425, id(font_material_design_icons_400_24), COLOR_BLACK, "%s", wifi_icon);
+        }
+
+        // Battery
+        {
+          float bat = id(battery_level).state;
+          if (isnan(bat)) bat = 0;
+          const char *bat_icon =
+              bat >= 95 ? "\U000F0079" : bat >= 85 ? "\U000F0082" : bat >= 75 ? "\U000F0081" :
+              bat >= 65 ? "\U000F0080" : bat >= 55 ? "\U000F007F" : bat >= 45 ? "\U000F007E" :
+              bat >= 35 ? "\U000F007D" : bat >= 25 ? "\U000F007C" : bat >= 15 ? "\U000F007B" :
+              bat >= 5  ? "\U000F007A" : "\U000F0083";
+          it.printf(760, 425, id(font_material_design_icons_400_24), COLOR_BLACK, "%s", bat_icon);
+          it.printf(760 + 12, 425 + 26, id(font_roboto_400_12), COLOR_BLACK, TextAlign::TOP_CENTER, "%.0f%%", bat);
+        }
+      }
