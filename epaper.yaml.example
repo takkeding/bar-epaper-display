@@ -17,5 +17,5 @@ packages:
   epaper:
     url: https://github.com/YOURNAME/epaper-display
     ref: main
-    files: [epaper.yaml]
+    files: [epaper_display_config.yaml]
     refresh: 0s        # always fetch the latest version when installing
