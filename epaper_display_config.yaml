@@ -608,7 +608,7 @@ script:
       delta: int
     then:
       - lambda: |-
-          static const int SEQ[] = {0, 3, 1,  0, 3, 2,  0, 3, 4};
+          static const int SEQ[] = {0, 1,  0, 2,  0, 3, 4};
           const int LEN = sizeof(SEQ) / sizeof(SEQ[0]);
           int step = (((id(seq_step) + delta) % LEN) + LEN) % LEN;
           id(seq_step) = step;
