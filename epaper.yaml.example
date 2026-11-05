@@ -1,0 +1,21 @@
+# Youri e-paper display
+
+substitutions:
+  name: youri-display
+  friendly_name: Youri Bar Display
+  # Secrets (from the secrets.yaml in your ESPHome folder)
+  api_key: !secret mancave_display_api_key
+  ota_password: !secret mancave_display_ota_password
+  wifi_ssid: !secret wifi_ssid
+  wifi_password: !secret wifi_password
+  # Only needed if your Buienradar entities are named differently:
+  # weather_entity: weather.buienradar
+  # feel_temp_entity: sensor.buienradar_feel_temperature
+  # wind_force_entity: sensor.buienradar_wind_force
+
+packages:
+  epaper:
+    url: https://github.com/YOURNAME/epaper-display
+    ref: main
+    files: [epaper.yaml]
+    refresh: 0s        # always fetch the latest version when installing
