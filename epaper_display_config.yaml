@@ -448,7 +448,7 @@ text:
     mode: TEXT
     min_length: 0
     max_length: 72
-    initial_value: "Welkom in de mancave"
+    initial_value: "Tering dikke bar hier"
     on_value:
       - script.execute: content_changed
   - platform: template
@@ -460,7 +460,7 @@ text:
     mode: TEXT
     min_length: 0
     max_length: 72
-    initial_value: "Pas aan op de ESPHome apparaatpagina"
+    initial_value: "Jeffrey is een toffe peer"
     on_value:
       - script.execute: content_changed
   - platform: template
