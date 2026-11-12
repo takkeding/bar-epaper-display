@@ -16,11 +16,36 @@
 #    If WiFi fails during that window, the fallback hotspot comes up
 #    (after ~1 min) so you can fix WiFi or upload firmware via the web UI.
 #  - Hard safety net: it always sleeps after 3 min (5 min edit window, 6 min cold boot).
+#
+# THIS FILE IS A REMOTE PACKAGE – it contains NO secrets.
+# The local config that includes it MUST define these substitutions:
+#   api_key, ota_password, web_password, ap_password, wifi_ssid, wifi_password
+# and MAY override the defaults below (name, friendly_name, weather entities).
+#
+# DO NOT CHANGE in updates (or saved texts/settings in flash are lost):
+#   - the `name:` of any text / select / switch below (incl. the "(72)" etc.)
+#   - max_length of the texts, the order of the interval select options
+#   - id + type of globals with restore_value: true
+#   - the esp32: block (board / framework / partitions)
 # ============================================================================
 
-esphome:
+substitutions:
   name: epaper-display
   friendly_name: ePaper Display
+  version: "1.0.0"                 # bump on every release; shows in HA device info
+  # Home Assistant entities used in the footer (Buienradar integration)
+  weather_entity: weather.buienradar
+  feel_temp_entity: sensor.buienradar_feel_temperature
+  wind_force_entity: sensor.buienradar_wind_force
+  # Secrets: intentionally NO defaults here – set them in the local config
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  # min_version: 2025.10.0         # optional: set to the ESPHome version you tested with
+  project:
+    name: "community.epaper-display"
+    version: ${version}
   compile_process_limit: 1
   on_boot:
     - priority: 600
@@ -56,11 +81,11 @@ logger:
 
 api:
   encryption:
-    key: !secret epaper_api_key
+    key: ${api_key}
 
 ota:
   - platform: esphome
-    password: !secret epaper_ota_password
+    password: ${ota_password}
   - platform: web_server          # firmware upload via the web interface
 
 # Web UI + firmware upload. Only reachable while awake (cold-boot window or stay-awake mode)
@@ -68,27 +93,20 @@ web_server:
   port: 80
   auth:
     username: admin
-    password: !secret epaper_web_password
+    password: nietmoeilijkdoen
 
 # Captive portal on the fallback hotspot: set new WiFi credentials / upload firmware
 captive_portal:
 
 wifi:
-  ssid: !secret wifi_ssid
-  password: !secret wifi_password
+  ssid: ${wifi_ssid}
+  password: ${wifi_password}
   fast_connect: true          # skip the scan, connect straight to the SSID
   # Fallback hotspot: starts when WiFi can't connect for ap_timeout.
   # Only realistic during the 5-min cold-boot window (normal wakes sleep sooner).
   ap:
-    ssid: "Epaper-Display Fallback"
-    password: !secret epaper_ap_password
-  ap_timeout: 60s
-  # A static IP saves another ~1-2s per wake (= battery). Optional:
-  # manual_ip:
-  #   static_ip: 192.168.1.80
-  #   gateway: 192.168.1.1
-  #   subnet: 255.255.255.0
-  #   dns1: 192.168.1.1
+    ssid: "${friendly_name} Setup"   # max 32 characters
+    password: fallback
 
 psram:
   mode: octal
@@ -165,7 +183,7 @@ globals:
     initial_value: 'false'
 
 # ----------------------------------------------------------------------------
-# Content + settings, pulled from Home Assistant helpers on every wake
+# Status text + weather data from Home Assistant
 # ----------------------------------------------------------------------------
 text_sensor:
   # What the screen is showing right now (keeps its last value while the device sleeps)
@@ -177,17 +195,17 @@ text_sensor:
   # Weather
   - platform: homeassistant
     id: weather_forecast_home
-    entity_id: weather.buienradar
+    entity_id: ${weather_entity}
     internal: true
 
 sensor:
   - platform: homeassistant
     id: sensor_buienradar_feel_temperature
-    entity_id: sensor.buienradar_feel_temperature
+    entity_id: ${feel_temp_entity}
     internal: true
   - platform: homeassistant
     id: sensor_buienradar_wind_force
-    entity_id: sensor.buienradar_wind_force
+    entity_id: ${wind_force_entity}
     internal: true
 
   - platform: adc
@@ -590,7 +608,7 @@ script:
       delta: int
     then:
       - lambda: |-
-          static const int SEQ[] = {0, 3, 1,  0, 3, 2,  0, 3, 4};
+          static const int SEQ[] = {0, 1,  0, 2,  0, 3, 4};
           const int LEN = sizeof(SEQ) / sizeof(SEQ[0]);
           int step = (((id(seq_step) + delta) % LEN) + LEN) % LEN;
           id(seq_step) = step;
@@ -658,7 +676,7 @@ script:
                   - deep_sleep.enter:
                       id: deep_sleep_1
                       sleep_duration: !lambda |-
-                        // "5 min" / "10 min" / "30 min" / "60 min" -> atoi reads the number
+                        // select index -> minutes (append new options at the END only, never reorder)
                         static const int MINS[] = {5, 10, 30, 60};  int mins = id(cfg_interval).active_index().has_value() ? MINS[*id(cfg_interval).active_index()] : 30;
                         if (mins <= 0) mins = 30;                       // fallback if HA value missing
                         uint32_t secs = mins * 60;
