@@ -8,8 +8,6 @@ Als het apparaatje de eerste keer start en natuurlijk nog geen WiFi heeft, zal d
 
 > [!WARNING]
 > Goed om te weten, bij 15 minuten inactiviteit schakelt het display al zijn power-saving-mode in. Mocht het apparaatje in de onderstaande stappen ineens niet meer te bereiken zijn is deze waarschijnlijk in slaap gevallen. Keer aan en uit zetten en je hebt weer 15 minuten om de configuratie af te ronden!
-> [!TIP]
-> De ververs knop zorgt ervoor dat het apparaatje 5 minuten aan blijft staan om even vlug nieuwe quotes erin te zetten, zonder dat deze helemaal uit en aan moet.
 
 Kan op twee manieren. Eerst de makkelijkste manier:  Vraag Jeffrey  
 Als je toch eerst zelf wil proberen dien je onderstaande stappen te doen
@@ -29,3 +27,7 @@ Voeg daarna de waardes toe uit [het voorbeeld secrets.yaml bestand](docs/secrets
 > [!WARNING]
 > Echt http, niet https. Browsers doen dat standaard vaak al voor je https maken ondanks dat je echt http:// doet. Ook kan het zijn dat het apparaatje intussen in slaapstand gevallen is. Zet 'm dan uit en aan.
 5. Daarna moet het apparaat in HomeAssistant staan onder **Appararaten > ESPHome > Bar Display**. Hier kun je nu makkelijk de waardes van de quotes enzo aanpassen zolang het apparaat niet in slaapstand staat. Hiervoor dient het apparaat ook niet in slaapstand te staan. Mocht het dus niet werken, even uit en aan :) 
+
+
+> [!TIP]
+> De ververs knop zorgt ervoor dat het apparaatje 5 minuten aan blijft staan om even vlug nieuwe quotes erin te zetten, zonder dat deze helemaal uit en aan moet.
