@@ -1,2 +1,2 @@
-# mancave-epaper
-ePaper apparaat voor de mancave van Youri!
+# ePaper display
+ePaper apparaat voor de bar van Youri!
